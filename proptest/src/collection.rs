@@ -382,21 +382,6 @@ impl<T: Ord> statics::FilterFn<BTreeSet<T>> for MinSize {
     }
 }
 
-opaque_strategy_wrapper! {
-    /// Strategy to create `BTreeSet`s with a length in a certain range.
-    ///
-    /// Created by the `btree_set()` function in the same module.
-    #[derive(Clone, Debug)]
-    pub struct BTreeSetStrategy[<T>][where T : Strategy, T::Value : Ord](
-        statics::Filter<statics::Map<VecStrategy<T>, VecToBTreeSet>, MinSize>)
-        -> BTreeSetValueTree<T::Tree>;
-    /// `ValueTree` corresponding to `BTreeSetStrategy`.
-    #[derive(Clone, Debug)]
-    pub struct BTreeSetValueTree[<T>][where T : ValueTree, T::Value : Ord](
-        statics::Filter<statics::Map<VecValueTree<T>, VecToBTreeSet>, MinSize>)
-        -> BTreeSet<T::Value>;
-}
-
 /// Create a strategy to generate `BTreeSet`s containing elements drawn from
 /// `element` and with a size range given by `size`.
 ///
@@ -411,11 +396,12 @@ where
     T::Value: Ord,
 {
     let size = size.into();
-    BTreeSetStrategy(statics::Filter::new(
-        statics::Map::new(vec(element, size.clone()), VecToBTreeSet),
-        "BTreeSet minimum size".into(),
-        MinSize(size.start()),
-    ))
+    let actual_size: usize = kani::any();
+    kani::assume(actual_size >= size.start() && actual_size < size.end_excl());
+    BTreeSetStrategy {
+        strategy: element,
+        size: actual_size,
+    }
 }
 
 mapfn! {
@@ -601,6 +587,90 @@ impl<T: ValueTree> ValueTree for VecValueTree<T> {
     /// Kani will run this function at most once.
     fn current(&self) -> Vec<T::Value> {
         self.current.as_ref().replace(vec![])
+    }
+
+    /// Simplifies the current value.
+    ///
+    /// Kani Optimization: This is not necessary for Kani, and getting
+    /// rid of this loop improves verification performance.
+    fn simplify(&mut self) -> bool {
+        false
+    }
+
+    /// Complicates the current value.
+    ///
+    /// Kani Optimization: This is not necessary for Kani, and getting
+    /// rid of this loop improves verification performance.
+    fn complicate(&mut self) -> bool {
+        false
+    }
+}
+
+/// Strategy to build a BTreeSet
+#[derive(Clone, Copy, Debug)]
+pub struct BTreeSetStrategy<S: Strategy>
+where
+    S::Value: Ord,
+{
+    strategy: S,
+    size: usize,
+}
+
+impl<S: Strategy> Strategy for BTreeSetStrategy<S>
+where
+    S::Value: Ord,
+{
+    type Tree = BTreeSetValueTree<S::Tree>;
+    type Value = BTreeSet<S::Value>;
+
+    /// Builds a new ValueTree<Vec<_>> by getting one value from each
+    /// strategy in a vector of strategies. Kani Optimization: loop
+    /// only once by storing the resulting vector in RefCell.
+    fn new_tree(&self, runner: &mut TestRunner) -> NewTree<Self> {
+        let mut set: BTreeSet<S::Value> = BTreeSet::new();
+
+        let current: RefCell<S::Value> =
+            RefCell::new(self.strategy.new_tree(runner).unwrap().current());
+        for _ in 0..self.size {
+            let next =
+                RefCell::new(self.strategy.new_tree(runner).unwrap().current());
+            kani::assume(current < next);
+            set.insert(current.replace(next.into_inner()));
+        }
+        kani::assume(self.size == set.len());
+
+        Ok(BTreeSetValueTree {
+            current: Rc::new(RefCell::new(Some(set))),
+        })
+    }
+}
+
+/// A Kani-optimized ValueTree for BTreeSet. This wraps a BTreeSet
+/// value, which is the current value.
+#[derive(Clone, Debug)]
+pub struct BTreeSetValueTree<T: ValueTree>
+where
+    T::Value: Ord,
+{
+    current: Rc<RefCell<Option<BTreeSet<T::Value>>>>,
+}
+
+impl<T: ValueTree> ValueTree for BTreeSetValueTree<T>
+where
+    T::Value: Ord,
+{
+    type Value = BTreeSet<T::Value>;
+
+    /// The current value is extracted out of the RC-RefCell-Option by
+    /// replacing it with an empty vector.
+    ///
+    /// Kani Optimization: This avoids having to copy the BTreeSet and
+    /// improves verification performance. Unlike vector, we find
+    /// `BTreeSet::new()` to be expensive, so we use an option wrapper
+    /// to avoid generating a new value in the first place. TODO:
+    /// propagate this optimization to the vector model.
+    fn current(&self) -> Self::Value {
+        self.current.as_ref().replace(None).unwrap()
     }
 
     /// Simplifies the current value.
